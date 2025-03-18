@@ -11,7 +11,7 @@ from accelerate.utils import gather_object, set_seed
 from datasets import Dataset, IterableDataset
 from transformers import (
     AutoModelForCausalLM, 
-    AutoTokenizer, 
+    AutoTokenizer,
     Trainer, 
     TrainingArguments,
 )
@@ -33,18 +33,11 @@ class FastGRPOConfig(TrainingArguments):
         default=8192,
         metadata={"help": "生成的最大长度"}
     )
-    num_generations: int = field(
-        default=16,
-        metadata={"help": "每个提示生成的样本数量"},
-    )
     beta: float = field(
         default=0.04,
         metadata={"help": "GRPO的KL散度系数"}
     )
-    temperature: float = field(
-        default=0.9,
-        metadata={"help": "生成时的温度"}
-    )
+
     model_init_kwargs: Optional[dict] = field(
         default=None,
         metadata={"help": "用于初始化模型的参数"}
@@ -122,6 +115,7 @@ class FastGRPOTrainer(Trainer):
     
         super().__init__(
             model=None if model_init else model,
+            model_init=model_init,
             args=args,
             data_collator=data_collator,
             train_dataset=train_dataset,

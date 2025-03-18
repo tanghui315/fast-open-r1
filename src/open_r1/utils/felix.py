@@ -14,17 +14,24 @@ def load_dataset_from_source(
 ) -> Dict[str, Dataset]:
     """
     加载数据集，支持本地jsonl文件或Huggingface数据集。
+    
+    注意：此函数根据不同来源返回不同的分割：
+    - 当从jsonl文件加载时，返回的DatasetDict包含'train'和'test'分割
+    - 当从HuggingFace加载时，返回原始数据集的所有分割（可能包括'train'、'validation'、'test'等）
+    
+    在使用返回的数据集时，请检查可用的分割键，并相应地设置dataset_split和eval_split参数。
 
     Args:
         source: 数据源路径或Huggingface数据集名称
         data_format: 数据格式，支持"jsonl"或"hf"
-        split_ratio: 测试集比例，默认0.1
+        split_ratio: 测试集比例，默认0.05 (5%)
         seed: 随机种子
         name: HuggingFace数据集配置名称
         **kwargs: 其他参数传递给load_dataset
 
     Returns:
-        DatasetDict: 包含'train'和'test'分割的数据集
+        DatasetDict: 包含数据集分割的字典。对于jsonl格式，包含'train'和'test'分割；
+                    对于HuggingFace数据集，包含原始数据集的所有分割。
     """
     if data_format == "jsonl":
         # 加载本地jsonl文件
@@ -53,6 +60,7 @@ def load_dataset_from_source(
         )
         
         # 返回DatasetDict而不是普通字典
+        # 注意：这里的分割名称固定为'train'和'test'
         return DatasetDict({
             "train": splits["train"],
             "test": splits["test"]
@@ -60,6 +68,7 @@ def load_dataset_from_source(
     
     elif data_format == "hf":
         # 加载HuggingFace数据集
+        # 注意：HuggingFace数据集可能有不同的分割名称，如'train'、'validation'、'test'等
         dataset = load_dataset(source, name=name, **kwargs)
         return dataset
     
@@ -75,6 +84,17 @@ SYSTEM_PROMPT = (
 
 
 def make_conversation(example):
+        """
+        将示例转换为对话格式。
+        
+        此函数将输入示例转换为包含系统提示和用户提示的对话格式，适用于大型语言模型的输入。
+        
+        Args:
+            example (dict): 包含'problem'字段的输入示例，可选包含'system'字段
+            
+        Returns:
+            dict: 包含格式化的'prompt'字段的字典
+        """
         system_content = example.get("system", SYSTEM_PROMPT)
         return {
             "prompt": [
@@ -85,7 +105,19 @@ def make_conversation(example):
 
 
 def format_reward(prompts, completions, **kwargs):
-    """Reward function that checks if the completion has a specific format based on system prompt."""
+    """
+    检查完成是否符合特定格式的奖励函数。
+    
+    根据系统提示中是否要求使用思考标签，检查生成的回答是否正确使用了<think></think>格式。
+    
+    Args:
+        prompts (list): 提示列表
+        completions (list): 完成列表，每个completion是具有'content'字段的字典列表
+        **kwargs: 其他参数
+        
+    Returns:
+        list: 表示每个完成格式正确性的奖励值列表（1.0表示正确，0.0表示错误）
+    """
     pattern = r"^<think>.*?</think>\s*.*$"
     completion_contents = [completion[0]["content"] for completion in completions]
     
@@ -117,7 +149,11 @@ def format_reward(prompts, completions, **kwargs):
     return rewards
 
 def reasoning_steps_reward(completions, **kwargs):
-    r"""Reward function that checks for clear step-by-step reasoning.
+    r"""
+    检查清晰的步骤推理的奖励函数。
+    
+    评估生成的回答中是否包含明确的步骤式推理，通过识别各种格式的步骤标记来判断。
+    
     Regex pattern:
         英文模式:
             Step \d+: - matches "Step 1:", "Step 2:", etc.
@@ -129,6 +165,13 @@ def reasoning_steps_reward(completions, **kwargs):
             第\d+步 - 匹配 "第1步"，"第2步" 等
             步骤\d+ - 匹配 "步骤1"，"步骤2" 等
             首先|然后|接着|最后 - 匹配中文过渡词
+            
+    Args:
+        completions (list): 完成列表，每个completion是具有'content'字段的字典列表
+        **kwargs: 其他参数
+        
+    Returns:
+        list: 表示每个完成中步骤推理清晰度的奖励值列表（0.0-1.0）
     """
     pattern = r"(Step\s*\d+[：:]?|^\d+\.|\n[-*]|(?:First|Second|Next|Finally)[,，]|第\d+步[：:]?|步骤\s*\d+[：:]?|(?:首先|然后|接着|最后)[，,])"
     completion_contents = [completion[0]["content"] for completion in completions]
@@ -138,9 +181,19 @@ def reasoning_steps_reward(completions, **kwargs):
     return [min(1.0, count / 3) for count in matches]
 
 def tag_count_reward(completions, **kwargs) -> list[float]:
-    """Reward function that checks if we produce the desired number of think and answer tags associated with `format_reward()`.
-
+    """
+    检查是否产生了与format_reward()相关的所需数量的think和answer标签的奖励函数。
+    
+    评估生成的回答中是否正确使用了<think>和</think>标签，并给予相应的奖励。
+    
     Adapted from: https://gist.github.com/willccbb/4676755236bb08cab5f4e54a0475d6fb#file-grpo_demo-py-L90
+    
+    Args:
+        completions (list): 完成列表，每个completion是具有'content'字段的字典列表
+        **kwargs: 其他参数
+        
+    Returns:
+        list: 表示每个完成中标签使用正确性的奖励值列表（0.0-1.0）
     """
 
     def count_tags(text: str) -> float:

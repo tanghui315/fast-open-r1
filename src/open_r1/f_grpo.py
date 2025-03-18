@@ -157,14 +157,6 @@ class GRPOScriptArguments(ScriptArguments):
         default=16,
         metadata={"help": "Number of generations per prompt"},
     )
-    max_prompt_length: int = field(
-        default=1024,
-        metadata={"help": "Maximum prompt length"}
-    )
-    max_completion_length: int = field(
-        default=8192,
-        metadata={"help": "Maximum completion length"}
-    )
     temperature: float = field(
         default=0.9,
         metadata={"help": "Temperature for generation"}
@@ -244,16 +236,19 @@ def generate_samples_with_vllm(
     # 配置采样参数
     sampling_params = SamplingParams(
         temperature=config.temperature,
-        max_tokens=config.max_completion_length,
+        max_tokens=config.vllm_max_model_len,
     )
     
-    # 格式化提示并预处理
-    if hasattr(prompts[0], "__getitem__") and "prompt" in prompts[0]:
-        # 如果prompts是字典格式
+    # 保存原始提示的所有字段（包括可能的额外信息）
+    original_samples = []
+    if hasattr(prompts[0], "__getitem__") and isinstance(prompts[0], dict):
+        # 如果prompts是字典格式（可能包含prompt以外的字段）
         prompt_texts = [p["prompt"] for p in prompts]
+        original_samples = prompts  # 保留所有原始数据
     else:
         # 如果prompts已经是文本格式
         prompt_texts = prompts
+        original_samples = [{"prompt": p} for p in prompts]  # 创建简单的字典
         
     # 扩展提示以生成多个样本
     expanded_prompts = []
@@ -276,13 +271,22 @@ def generate_samples_with_vllm(
     for i, output in tqdm(enumerate(outputs), total=len(outputs), desc="处理生成结果"):
         prompt_idx = i // config.num_generations
         original_prompt = prompt_texts[prompt_idx]
+        original_sample = original_samples[prompt_idx]  # 获取原始样本的所有字段
+        
         for completion_output in output.outputs:
             completion = completion_output.text
-            results.append({
+            result_item = {
                 "prompt": original_prompt,
                 "completion": completion,
                 "prompt_idx": prompt_idx,
-            })
+            }
+            
+            # 添加原始样本中的所有其他字段（保留额外信息，如参考答案等）
+            for key, value in original_sample.items():
+                if key != "prompt" and key not in result_item:
+                    result_item[key] = value
+                    
+            results.append(result_item)
             
     # 计算奖励和优势
     logger.info("计算奖励和优势...")
@@ -299,9 +303,14 @@ def generate_samples_with_vllm(
     for sample in tqdm(results, desc="计算奖励"):
         rewards = []
         for reward_func in reward_funcs:
+            # 收集除了"prompt"、"completion"和"prompt_idx"之外的所有字段作为额外参数
+            extra_keys = [key for key in sample if key not in ["prompt", "completion", "prompt_idx", "reward", "advantage"]]
+            reward_kwargs = {key: [sample[key]] for key in extra_keys}
+            
             reward = reward_func(
                 prompts=[sample["prompt"]], 
-                completions=[sample["completion"]]
+                completions=[sample["completion"]],
+                **reward_kwargs  # 传递额外参数
             )[0]
             rewards.append(reward)
         # 如果有多个奖励函数，使用权重计算总体奖励
@@ -316,7 +325,7 @@ def generate_samples_with_vllm(
         
         for sample in group:
             # 计算标准化的优势值
-            sample["advantage"] = (sample["reward"] - mean_reward) / (std_reward + 1e-8)
+            sample["advantage"] = (sample["reward"] - mean_reward) / (std_reward + 1e-4)
             
     # 关闭vLLM引擎
     logger.info("正在关闭vLLM服务...")
@@ -342,12 +351,20 @@ def prepare_training_data(samples):
     train_data = []
     
     for sample in tqdm(positive_samples, desc="处理训练样本"):
-        train_data.append({
+        # 创建基本数据项，包括必需字段
+        sample_data = {
             "prompt": sample["prompt"],
             "completion": sample["completion"],
             "advantage": sample["advantage"],
             "reward": sample["reward"],
-        })
+        }
+        
+        # 保留样本中的所有其他字段（除了prompt_idx，它只用于内部处理）
+        for key in sample:
+            if key not in sample_data and key != "prompt_idx":
+                sample_data[key] = sample[key]
+                
+        train_data.append(sample_data)
     
     # 转换为Dataset格式
     return Dataset.from_list(train_data)
@@ -487,11 +504,9 @@ def main(script_args, training_args, model_args):
             gradient_accumulation_steps=training_args.gradient_accumulation_steps,
             max_steps=training_args.max_steps,
             num_train_epochs=training_args.num_train_epochs,
-            max_prompt_length=script_args.max_prompt_length,
-            max_completion_length=script_args.max_completion_length,
-            num_generations=script_args.num_generations,
+            max_prompt_length=training_args.max_prompt_length,
+            max_completion_length=training_args.max_completion_length,
             beta=getattr(training_args, "beta", 0.1),
-            temperature=script_args.temperature,
             fp16=training_args.fp16,
             bf16=training_args.bf16,
             model_init_kwargs=training_args.model_init_kwargs,
@@ -537,17 +552,17 @@ def main(script_args, training_args, model_args):
             else:
                 logger.info("非主进程等待vLLM采样结果...")
                 samples = None
-            
-            # 创建FastGRPOTrainer
+        
+        # 创建FastGRPOTrainer
             logger.info("初始化训练器...")
             trainer = FastGRPOTrainer(
                 model=current_model_path,
-                reward_funcs=reward_funcs,
-                args=fast_config,
+            reward_funcs=reward_funcs,
+            args=fast_config,
                 train_dataset=None,  # 先不设置数据集
                 eval_dataset=eval_dataset,
-                processing_class=tokenizer,
-                peft_config=get_peft_config(model_args),
+            processing_class=tokenizer,
+            peft_config=get_peft_config(model_args),
             )
             
             # 让训练器自己处理数据广播
