@@ -16,6 +16,7 @@ from transformers import (
     TrainingArguments,
 )
 from transformers.trainer_utils import EvalLoopOutput
+from transformers.utils import is_liger_kernel_available
 from tqdm.auto import tqdm
 
 logger = logging.getLogger(__name__)
@@ -51,6 +52,35 @@ class FastGRPOConfig(TrainingArguments):
         default=None, 
         metadata={"help": "The chat template to use."}
     )
+    # Liger kernel 相关参数
+    use_liger_kernel: bool = field(
+        default=False,
+        metadata={"help": "是否启用 Liger kernel 优化来降低内存消耗"}
+    )
+
+def apply_liger_kernel(model, use_liger_kernel=False):
+    """应用Liger Kernel优化到模型"""
+    if not use_liger_kernel:
+        return model
+        
+    if not is_liger_kernel_available():
+        raise ImportError(
+            "您设置了 `use_liger_kernel=True` 但 liger-kernel >= 0.3.0 未安装。"
+            "请使用 `pip install liger-kernel` 安装"
+        )
+        
+    from liger_kernel.transformers import _apply_liger_kernel_to_instance
+    
+    # 检查是否为PEFT模型
+    if hasattr(model, "get_base_model"):
+        base_model = model.get_base_model()
+        _apply_liger_kernel_to_instance(model=base_model)
+        logger.info("已对PEFT模型的基础模型应用Liger Kernel优化")
+    else:
+        _apply_liger_kernel_to_instance(model=model)
+        logger.info("已对基础模型应用Liger Kernel优化")
+    
+    return model
 
 class FastGRPOTrainer(Trainer):
     """
@@ -125,6 +155,10 @@ class FastGRPOTrainer(Trainer):
             optimizers=optimizers,
         )
         
+        # 如果不是延迟加载且是已加载的模型，应用Liger kernel优化
+        if model_init is None and self.model is not None:
+            self.model = apply_liger_kernel(self.model, args.use_liger_kernel)
+        
         # 初始化参考模型
         self.init_ref_model()
     
@@ -140,11 +174,23 @@ class FastGRPOTrainer(Trainer):
                 elif torch_dtype_str == 'auto':
                     torch_dtype = 'auto'
                 
-            return AutoModelForCausalLM.from_pretrained(
+            # 加载模型
+            model = AutoModelForCausalLM.from_pretrained(
                 model_name,
                 torch_dtype=torch_dtype,
                 use_cache=False if self.args.gradient_checkpointing else True,
             )
+            
+            # 应用PEFT配置（如果有）
+            if self.peft_config is not None:
+                from peft import get_peft_model
+                model = get_peft_model(model, self.peft_config)
+            
+            # 应用Liger kernel优化
+            model = apply_liger_kernel(model, self.args.use_liger_kernel)
+            
+            return model
+            
         return model_init
     
     def init_ref_model(self):
@@ -174,6 +220,10 @@ class FastGRPOTrainer(Trainer):
                 self.model_name,
                 torch_dtype=torch_dtype,
             )
+            
+            # 应用Liger kernel优化到参考模型
+            self.ref_model = apply_liger_kernel(self.ref_model, self.args.use_liger_kernel)
+            
             # 将参考模型移至适当设备并设为评估模式
             self.ref_model = self.accelerator.prepare_model(self.ref_model, evaluation_mode=True)
             logger.info("已创建参考模型副本")

@@ -21,6 +21,31 @@ if is_e2b_available():
 
 def accuracy_reward(completions, solution, **kwargs):
     """Reward function that checks if the completion is the same as the ground truth."""
+    # 添加调试输出
+    print("=" * 50)
+    print("accuracy_reward 调试信息:")
+    print(f"completions 类型: {type(completions)}, 长度: {len(completions)}")
+    print(f"solution 类型: {type(solution)}, 长度: {len(solution)}")
+    
+    if len(completions) > 0:
+        print("\n第一个completion样例:")
+        print(f"类型: {type(completions[0])}")
+        print(f"内容: {completions[0]}")
+        
+        if isinstance(completions[0], list) and len(completions[0]) > 0:
+            print(f"\ncompletion[0][0] 类型: {type(completions[0][0])}")
+            print(f"completion[0][0] 内容: {completions[0][0]}")
+            
+            if isinstance(completions[0][0], dict) and "content" in completions[0][0]:
+                print(f"\ncontent 内容: {completions[0][0]['content'][:100]}..." if len(completions[0][0]['content']) > 100 else completions[0][0]['content'])
+    
+    if len(solution) > 0:
+        print("\n第一个solution样例:")
+        print(f"类型: {type(solution[0])}")
+        print(f"内容: {solution[0][:100]}..." if len(solution[0]) > 100 else solution[0])
+    
+    print("=" * 50)
+    exit()
     contents = [completion[0]["content"] for completion in completions]
     rewards = []
     for content, sol in zip(contents, solution):

@@ -32,10 +32,39 @@ export MKL_SERVICE_FORCE_INTEL=1
 
 
 
+accelerate launch --config_file ./fsdp_config.yaml src/orpo/train.py \
+  --model_name_or_path /home/ubisec/codeqwen/merged_kit_qwen_model_3 \
+  --train_file /home/ubisec/data/DPO_data/DPO_data.json \
+  --eval_ratio 0.05 \
+  --output_dir ./orpo_output \
+  --beta 0.1 \
+  --max_length 8192 \
+  --max_prompt_length 2048 \
+  --max_completion_length 4096 \
+  --lora_r 16 \
+  --lora_alpha 32 \
+  --lora_dropout 0.05 \
+  --lora_target_modules "q_proj,v_proj,k_proj,o_proj" \
+  --use_flash_attention True \
+  --per_device_train_batch_size 1 \
+  --per_device_eval_batch_size 1 \
+  --gradient_accumulation_steps 1 \
+  --learning_rate 5e-6 \
+  --num_train_epochs 2 \
+  --use_liger_kernel True \
+  --use_4bit True \
+  --save_steps 1000 \
+  --eval_steps 500 \
+  --report_to none \
+  --lr_scheduler_type cosine \
+  --logging_steps 10  \
+  --warmup_ratio 0.1 \
+  --bf16 True
+
 
 python -m open_r1.run_pipeline \
-  --model "Qwen/Qwen2-7B-Instruct" \
-  --dataset "/path/to/your/dataset.jsonl" \
+  --model /home/valiantsec/codestral/merged_sft3_model \
+  --dataset /home/valiantsec/open-r1/RL.jsonl \
   --output-dir "./output/run1" \
   --num-train-epochs 2 \
   --batch-size 32 \

@@ -215,14 +215,14 @@ def main():
                    f"批次 {train_batch_in_epoch+1}/{train_batches_per_epoch} "
                    f"(全局批次 {global_batch_idx+1}/{total_batches}) =====")
         
-        # 创建批次目录
+        # 创建全局批次目录
         batch_dir = os.path.join(args.output_dir, f"batch-{global_batch_idx}")
         os.makedirs(batch_dir, exist_ok=True)
         
-        # vLLM采样阶段 - 使用train_batch_in_epoch
-        train_samples_file = os.path.join(batch_dir, "samples.json")
+        # 使用train_batch_in_epoch创建训练样本文件
+        train_samples_file = os.path.join(batch_dir, f"samples_train_batch{train_batch_in_epoch}.jsonl")
         
-        logger.info(f"正在生成样本到 {train_samples_file}...")
+        logger.info(f"正在生成训练样本到 {train_samples_file}...")
         
         vllm_cmd = f"""
         python -m open_r1.vllm_sampler \\
@@ -237,34 +237,25 @@ def main():
           --vllm_tensor_parallel_size {args.vllm_tensor_parallel_size} \\
           --vllm_gpu_memory_utilization {args.vllm_gpu_memory_utilization} \\
           --reward_funcs {' '.join(args.reward_funcs)} \\
-          --seed {args.seed}
-        """
+          --seed {args.seed}"""
         
         # 添加评估分割处理
-        if args.include_eval:
-            eval_cmd_part = f" --include_eval --eval_split {args.eval_split} --eval_batch_size {args.eval_batch_size}"
-            if eval_batch_in_epoch is not None:
-                eval_cmd_part += f" --eval_batch_idx {eval_batch_in_epoch}"
-            vllm_cmd += eval_cmd_part
+        eval_samples_file = None
+        if args.include_eval and eval_batch_in_epoch is not None:
+            # 使用eval_batch_in_epoch创建评估样本文件
+            eval_samples_file = os.path.join(batch_dir, f"samples_{args.eval_split}_batch{eval_batch_in_epoch}.jsonl")
             
-            # 计算评估样本文件路径
-            eval_samples_file = train_samples_file
-            if eval_samples_file.endswith('.json'):
-                eval_samples_file = eval_samples_file.replace('.json', f'_{args.eval_split}.json')
-            elif eval_samples_file.endswith('.jsonl'):
-                eval_samples_file = eval_samples_file.replace('.jsonl', f'_{args.eval_split}.jsonl')
-            else:
-                eval_samples_file = f"{eval_samples_file}_{args.eval_split}"
-        else:
-            eval_samples_file = None
+            eval_cmd_part = f" \\\n  --include_eval --eval_split {args.eval_split} --eval_batch_size {args.eval_batch_size}"
+            eval_cmd_part += f" \\\n  --eval_batch_idx {eval_batch_in_epoch} --eval_output_file {eval_samples_file}"
+            vllm_cmd += eval_cmd_part
         
         # 添加可选参数
         if args.dataset_config:
-            vllm_cmd += f" --dataset_config {args.dataset_config}"
+            vllm_cmd += f" \\\n  --dataset_config {args.dataset_config}"
         if args.chat_template:
-            vllm_cmd += f" --chat_template {args.chat_template}"
+            vllm_cmd += f" \\\n  --chat_template {args.chat_template}"
         if not args.trust_remote_code:
-            vllm_cmd += " --no-trust_remote_code"
+            vllm_cmd += " \\\n  --no-trust_remote_code"
         
         # 运行vLLM采样命令
         run_command(vllm_cmd.strip(), "vLLM采样")
@@ -277,7 +268,8 @@ def main():
         
         # 构建基本训练命令
         train_cmd = f"""
-        accelerate launch {args.accelerate_args} -m open_r1.train_grpo \\
+        accelerate launch {args.accelerate_args} --config_file recipes/accelerate_configs/zero3.yaml \\
+          --num_processes=4 src/open_r1/train_grpo.py \\
           --model_path {current_model_path} \\
           --output_dir {train_output_dir} \\
           --samples_file {train_samples_file} \\
@@ -293,6 +285,7 @@ def main():
         
         # 添加验证数据
         if args.do_eval and args.include_eval and eval_samples_file and os.path.exists(eval_samples_file):
+            logger.info(f"使用评估样本 {eval_samples_file} 进行评估...")
             train_cmd += f" --eval_samples_file {eval_samples_file}"
             train_cmd += f" --per_device_eval_batch_size {args.per_device_eval_batch_size}"
             train_cmd += f" --eval_strategy {args.eval_strategy}"

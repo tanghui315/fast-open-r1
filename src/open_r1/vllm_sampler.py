@@ -18,6 +18,10 @@ from dataclasses import dataclass, field
 from typing import List, Optional, Union, Dict, Any
 from tqdm.auto import tqdm
 
+# 设置多进程启动方法为spawn，解决CUDA多进程初始化问题
+import multiprocessing
+multiprocessing.set_start_method('spawn', force=True)
+
 import datasets
 from datasets import load_dataset, Dataset
 from transformers import HfArgumentParser, set_seed, AutoTokenizer
@@ -176,6 +180,10 @@ class SamplerArguments:
         default=None,
         metadata={"help": "评估数据集的批次索引，如果为None则使用batch_idx"}
     )
+    eval_output_file: Optional[str] = field(
+        default=None,
+        metadata={"help": "评估数据集生成样本的输出文件路径，如果为None则根据output_file自动生成"}
+    )
 
 def generate_samples_with_vllm(
     model_path: str, 
@@ -218,22 +226,22 @@ def generate_samples_with_vllm(
     # 初始化vLLM引擎
     try:
         # 修补vLLM的torch.distributed.get_world_size检查
-        from unittest.mock import patch
-        world_size_patch = patch("torch.distributed.get_world_size", return_value=1)
-        profiling_patch = patch(
-            "vllm.worker.worker.Worker._assert_memory_footprint_increased_during_profiling", 
-            return_value=None
-        )
+        # from unittest.mock import patch
+        # world_size_patch = patch("torch.distributed.get_world_size", return_value=1)
+        # profiling_patch = patch(
+        #     "vllm.worker.worker.Worker._assert_memory_footprint_increased_during_profiling", 
+        #     return_value=None
+        # )
         
-        with world_size_patch, profiling_patch:
-            vllm_engine = LLM(
-                model=model_path,
-                tensor_parallel_size=tensor_parallel_size,
-                gpu_memory_utilization=args.vllm_gpu_memory_utilization,
-                max_model_len=args.vllm_max_model_len,
-                enable_prefix_caching=True,
-                trust_remote_code=args.trust_remote_code,
-            )
+        # with world_size_patch, profiling_patch:
+        vllm_engine = LLM(
+            model=model_path,
+            tensor_parallel_size=tensor_parallel_size,
+            gpu_memory_utilization=args.vllm_gpu_memory_utilization,
+            max_model_len=args.vllm_max_model_len,
+            enable_prefix_caching=True,
+            trust_remote_code=args.trust_remote_code,
+        )
         
         logger.info(f"vLLM服务已启动，使用{tensor_parallel_size}个GPU")
         
@@ -249,15 +257,74 @@ def generate_samples_with_vllm(
     
     # 保存原始提示的所有字段（包括可能的额外信息）
     original_samples = []
+    original_prompts = []  # 用于存储原始prompt格式
+    prompt_texts = []  # 用于存储转换后的纯文本格式，供vLLM使用
+
     if hasattr(prompts[0], "__getitem__") and isinstance(prompts[0], dict):
         # 如果prompts是字典格式（可能包含prompt以外的字段）
-        prompt_texts = [p["prompt"] for p in prompts]
-        original_samples = prompts  # 保留所有原始数据
+        for p in prompts:
+            # 保存原始prompt格式，供奖励函数使用
+            if "prompt" in p:
+                original_prompts.append(p["prompt"])  # 原始格式
+                
+                # 将prompt转换为文本格式，供vLLM使用
+                prompt_text = ""
+                if isinstance(p["prompt"], list):
+                    # 多轮对话格式处理
+                    logger.info("检测到多轮对话格式，将转换为聊天模板文本")
+                    messages = p["prompt"]
+                    # 使用tokenizer的chat_template格式化对话
+                    if tokenizer.chat_template:
+                        # 复制一份消息，避免修改原始数据
+                        messages_dict = {"messages": messages.copy()}
+                        prompt_text = tokenizer.apply_chat_template(
+                            messages_dict["messages"],
+                            tokenize=False,
+                            add_generation_prompt=True
+                        )
+                    else:
+                        # 如果没有chat_template， 报错终止
+                        raise ValueError("没有找到聊天模板，请检查tokenizer是否正确配置")
+                elif not isinstance(p["prompt"], str):
+                    logger.warning(f"发现非字符串prompt，类型为：{type(p.get('prompt'))}，尝试转换为字符串")
+                    if isinstance(p.get("prompt"), dict) and "content" in p.get("prompt"):
+                        # 如果是单条消息格式，提取content字段
+                        prompt_text = p["prompt"]["content"]
+                    else:
+                        # 其他情况尝试转换为字符串
+                        prompt_text = str(p.get("prompt", ""))
+                else:
+                    # 已经是字符串格式
+                    prompt_text = p["prompt"]
+                
+                # 为了让vLLM正常工作，我们需要把转换后的文本格式保存回p
+                # 但为了避免修改原始数据，我们创建一个副本
+                sample_copy = p.copy()
+                sample_copy["prompt"] = prompt_text
+                original_samples.append(sample_copy)
+                prompt_texts.append(prompt_text)
+            else:
+                logger.warning(f"样本中缺少'prompt'字段: {p.keys()}")
+                original_prompts.append("")  # 空字符串作为占位符
+                prompt_texts.append("")
+                original_samples.append(p.copy())
     else:
         # 如果prompts已经是文本格式
-        prompt_texts = prompts
-        original_samples = [{"prompt": p} for p in prompts]  # 创建简单的字典
-        
+        for p in prompts:
+            if not isinstance(p, str):
+                logger.warning(f"发现非字符串prompt，类型为：{type(p)}，尝试转换为字符串")
+                original_prompts.append(p)  # 保存原始格式
+                p = str(p)
+                prompt_texts.append(p)
+            else:
+                original_prompts.append(p)  # 原始就是字符串
+                prompt_texts.append(p)
+            original_samples.append({"prompt": p})  # 创建简单的字典
+
+    # 打印一些调试信息
+    if prompt_texts and len(prompt_texts) > 0:
+        logger.info(f"处理后的prompt示例：\n{prompt_texts[0][:200]}..." if len(prompt_texts[0]) > 200 else prompt_texts[0])
+    
     # 扩展提示以生成多个样本
     expanded_prompts = []
     for prompt in prompt_texts:
@@ -278,14 +345,26 @@ def generate_samples_with_vllm(
     logger.info("处理生成的结果...")
     for i, output in tqdm(enumerate(outputs), total=len(outputs), desc="处理生成结果"):
         prompt_idx = i // args.num_generations
-        original_prompt = prompt_texts[prompt_idx]
+        text_prompt = prompt_texts[prompt_idx]  # 文本格式的prompt
+        original_prompt = original_prompts[prompt_idx]  # 原始格式的prompt
         original_sample = original_samples[prompt_idx]  # 获取原始样本的所有字段
         
         for completion_output in output.outputs:
-            completion = completion_output.text
+            completion_text = completion_output.text
+            
+            # 根据prompt格式决定如何格式化completion
+            if isinstance(original_prompt, list) and all(isinstance(item, dict) and "role" in item for item in original_prompt):
+                # 如果prompt是对话格式，则completion也应该是对话格式
+                formatted_completion = [{"role": "assistant", "content": completion_text}]
+            else:
+                # 对于非对话格式，也包装成带content的字典列表，以满足accuracy_reward函数的要求
+                formatted_completion = [{"content": completion_text}]
+            
             result_item = {
-                "prompt": original_prompt,
-                "completion": completion,
+                "prompt": original_prompt,  # 使用原始格式，供奖励函数计算
+                "text_prompt": text_prompt,  # 保存文本格式，便于调试
+                "completion": formatted_completion,  # 使用格式化后的completion
+                "completion_text": completion_text,  # 保存原始文本格式，便于查看
                 "prompt_idx": prompt_idx,
             }
             
@@ -311,15 +390,16 @@ def generate_samples_with_vllm(
     for sample in tqdm(results, desc="计算奖励"):
         rewards = []
         for reward_func in reward_funcs:
-            # 收集除了"prompt"、"completion"和"prompt_idx"之外的所有字段作为额外参数
-            extra_keys = [key for key in sample if key not in ["prompt", "completion", "prompt_idx", "reward", "advantage"]]
+            # 收集除了特定字段之外的所有字段作为额外参数
+            extra_keys = [key for key in sample if key not in ["prompt", "completion", "completion_text", "prompt_idx", "reward", "advantage", "text_prompt"]]
             reward_kwargs = {key: sample[key] for key in extra_keys}
             
-            # 为了兼容reward_func的接口，将单个样本包装成列表
+            # 奖励函数期望的格式：prompts和completions都是列表
+            # 这里无需额外格式化，因为我们已经在生成结果时格式化了completion
             reward = reward_func(
                 prompts=[sample["prompt"]], 
                 completions=[sample["completion"]],
-                **{k: [v] for k, v in reward_kwargs.items()}  # 将每个值包装成列表
+                **{k: [v] for k, v in reward_kwargs.items()}
             )[0]
             rewards.append(reward)
         
@@ -522,13 +602,16 @@ def main():
             return
             
         # 准备评估数据集的输出文件
-        eval_output_file = args.output_file
-        if eval_output_file.endswith('.json'):
-            eval_output_file = eval_output_file.replace('.json', f'_{eval_split_name}.json')
-        elif eval_output_file.endswith('.jsonl'):
-            eval_output_file = eval_output_file.replace('.jsonl', f'_{eval_split_name}.jsonl')
+        if args.eval_output_file:
+            eval_output_file = args.eval_output_file
         else:
-            eval_output_file = f"{eval_output_file}_{eval_split_name}"
+            eval_output_file = args.output_file
+            if eval_output_file.endswith('.json'):
+                eval_output_file = eval_output_file.replace('.json', f'_{eval_split_name}.json')
+            elif eval_output_file.endswith('.jsonl'):
+                eval_output_file = eval_output_file.replace('.jsonl', f'_{eval_split_name}.jsonl')
+            else:
+                eval_output_file = f"{eval_output_file}_{eval_split_name}"
         
         # 使用独立的评估批次索引
         batch_idx_for_eval = args.eval_batch_idx if args.eval_batch_idx is not None else args.batch_idx
