@@ -40,6 +40,11 @@ We will use the DeepSeek-R1 [tech report](https://github.com/deepseek-ai/DeepSee
     <img src="assets/plan-of-attack.png" width="500">
 </center>
 
+## News 🗞️
+
+* **⚡️ [2025/03/11] [(update #3)](https://huggingface.co/blog/open-r1/update-3):** We release the [**CodeForces-CoTs**](https://huggingface.co/datasets/open-r1/codeforces-cots) dataset of 10k competitive programming problems and 100k solutions distilled from R1. We also release IOI24: a new benchmark of _very_ hard problems from international olympiads. A 7B Qwen model trained on CodeForces-CoTs can outperform Claude 3.7 Sonnet on IOI24, while a 32B model can outperform R1 itself.
+* **∞ [2025/02/10] [(update #2)](https://huggingface.co/blog/open-r1/update-2):** We release the [**OpenR1-Math-220k**](https://huggingface.co/datasets/open-r1/OpenR1-Math-220k) dataset of 220k traces distilled from R1 on a new version of NuminaMath. Models trained on this dataset match the performance of DeepSeek's distilled ones.
+* **🔥 [2025/02/02] [(update #1)](https://huggingface.co/blog/open-r1/update-1):** We implement the first parts of the [training](https://github.com/huggingface/open-r1?tab=readme-ov-file#training-models), [inference](https://github.com/huggingface/open-r1?tab=readme-ov-file#data-generation), and [evaluation](https://github.com/huggingface/open-r1?tab=readme-ov-file#reproducing-deepseeks-evaluation-results) pipelines. Let's go!  
 
 ## Installation
 
@@ -156,27 +161,30 @@ ACCELERATE_LOG_LEVEL=info accelerate launch --config_file recipes/accelerate_con
 
 ### GRPO
 
-To train via the GRPO trainer, we use one GPU to run vLLM for faster generation and the remaining GPUs for training. For example, one a node with 8 GPUs, set `--num_processes` to override the default value in the `accelerate` configs:
+We use TRL's [vLLM backend](https://huggingface.co/docs/trl/speeding_up_training?vllm+examples=GRPO#vllm-for-fast-generation-in-online-methods) to scale training to large models across multiple nodes. For single-node training of smol models across 8 GPUs, first spin up the vLLM server to run on e.g. 1 GPU as follows:
 
 ```shell
-ACCELERATE_LOG_LEVEL=info accelerate launch --config_file recipes/accelerate_configs/zero2.yaml \
-    --num_processes=7 src/open_r1/grpo.py \
-    --config recipes/DeepSeek-R1-Distill-Qwen-1.5B/grpo/config_demo.yaml
+CUDA_VISIBLE_DEVICES=0 trl vllm-serve --model deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B
+```
+
+Once the server is up, run training on the remaining GPUs as follows:
+
+```shell
+CUDA_VISIBLE_DEVICES=1,2,3,4,5,6,7 ACCELERATE_LOG_LEVEL=info \
+    accelerate launch --config_file recipes/accelerate_configs/zero2.yaml --num_processes 7 \
+    src/open_r1/grpo.py --config recipes/DeepSeek-R1-Distill-Qwen-1.5B/grpo/config_demo.yaml
 ```
 
 > [!WARNING]
 > The chat template used in the distilled DeepSeek models omits the contents of the reasoning block within the `<think>` and `</think>` tags. It also prefills the assistant response with `<think>` which interferes with the format reward function. To handle that, it is important to override the chat template as done in e.g.  [recipes/DeepSeek-R1-Distill-Qwen-1.5B/grpo/config_demo.yaml](./recipes/DeepSeek-R1-Distill-Qwen-1.5B/grpo/config_demo.yaml).
 
-
-We provide a minimal reproducible experiment using GRPO for mathematical reasoning, referencing the approach from [SimpleRL-Reason](https://hkust-nlp.notion.site/simplerl-reason) which uses a 7B model trained on 8K examples. Running this on 8 H100 80G GPU takes about 3 hours:
+For multi-node training, we provide an example Slurm script:
 
 ```shell
-ACCELERATE_LOG_LEVEL=info accelerate launch --config_file recipes/accelerate_configs/zero2.yaml \
-    --num_processes=7 src/open_r1/grpo.py \
-    --config recipes/Qwen2.5-Math-7B/grpo/config_simple_rl.yaml
+sbatch --nodes=2 slurm/train.slurm Qwen2.5-Math-7B grpo config_simple_rl zero3 
 ```
 
-Our final [model](https://huggingface.co/Dongwei/Qwen-2.5-7B_Base_Math_smalllr), while using different learning rates, loss functions and reward structures, achieves 69.4% accuracy on MATH-500, demonstrating a 17%+ improvement over the base model.
+You will need to adapt the `slurm/train.slurm` script to match your cluster.
 
 #### 👨‍💻 Training with a code interpreter
 
@@ -207,13 +215,35 @@ Then make sure your dataset contains a `verification_info` column with the follo
 }
 ```
 
-For example, to train a smol model on Python problems, run:
+For example, to train a smol model on Python problems, start the vLLM server:
+
+```shell
+CUDA_VISIBLE_DEVICES=0 trl vllm-serve --model Qwen/Qwen2.5-1.5B-Instruct
+```
+
+Then run training with:
+
+```shell
+CUDA_VISIBLE_DEVICES=1,2,3,4,5,6,7 ACCELERATE_LOG_LEVEL=info \ 
+    accelerate launch --config_file recipes/accelerate_configs/zero2.yaml --num_processes=7 
+    src/open_r1/grpo.py --config recipes/Qwen2.5-1.5B-Instruct/grpo/config_demo_code.yaml
+```
+
+#### IOI problems
+
+We provide a `ioi_code_reward` reward function for executing problems from [IOI](https://hf.co/datasets/open-r1/ioi) using [piston](https://github.com/engineer-man/piston).
+
+To get piston workers running, see [slurm/piston/README.md](./slurm/piston/README.md).
+Set your environment variable `PISTON_ENDPOINTS` to `slurm` or to a list of piston worker endpoints.
+
+See the [example recipe](./recipes/Qwen2.5-1.5B-Instruct/grpo/config_demo_code_ioi.yaml) for how to use the reward function:
 
 ```shell
 ACCELERATE_LOG_LEVEL=info accelerate launch --config_file recipes/accelerate_configs/zero2.yaml \
     --num_processes=7 src/open_r1/grpo.py \
-    --config recipes/Qwen2.5-1.5B-Instruct/grpo/config_demo_code.yaml
+    --config recipes/Qwen2.5-1.5B-Instruct/grpo/config_demo_code_ioi.yaml
 ```
+
 
 #### Data decontamination
 
@@ -462,7 +492,7 @@ python scripts/run_benchmarks.py --model-id {model_id}  --benchmarks gpqa
 
 We are able to reproduce Deepseek's reported results on the LiveCodeBench code generation benchmark within ~1-3 standard deviations:
 
-| Model                         | LiveCodeBench (🤗 LightEval) | GPQA Diamond (DeepSeek Reported) |
+| Model                         | LiveCodeBench (🤗 LightEval) | LiveCodeBench (DeepSeek Reported) |
 |:------------------------------|:----------------------------:|:--------------------------------:|
 | DeepSeek-R1-Distill-Qwen-1.5B |             16.3             |               16.9               |
 | DeepSeek-R1-Distill-Qwen-7B   |             36.6             |               37.6               |
